@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - candidates.json
+      - tools/**
+      - .github/workflows/verify.yml
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:

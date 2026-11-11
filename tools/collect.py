@@ -5,6 +5,7 @@ never printed."""
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 
@@ -27,9 +28,22 @@ def main():
     body = json.dumps({'ids': alive_ids, 'tested': tested}).encode()
     req = urllib.request.Request(
         f'https://sub.glmd.de5.net/{token}/verified',
-        data=body, headers={'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(req, timeout=60) as r:
-        print('worker response:', r.status, r.read()[:120].decode('utf-8', 'replace'))
+        data=body, method='POST', headers={
+            'Content-Type': 'application/json',
+            # A default Python-urllib agent gets 403'd by Cloudflare bot
+            # heuristics; present as a regular browser client instead.
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                          '(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            print('worker response:', r.status,
+                  r.read()[:120].decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        print('worker rejected:', e.code,
+              e.read()[:200].decode('utf-8', 'replace'))
+        return 1
 
 
 if __name__ == '__main__':
