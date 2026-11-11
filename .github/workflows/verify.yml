@@ -1,0 +1,30 @@
+name: verify-nodes
+
+# Runs when a fresh candidate list is pushed, plus a periodic re-check.
+on:
+  push:
+    paths:
+      - candidates.json
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: verify-nodes
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+      - name: Run health check
+        env:
+          SUB_TOKEN: ${{ secrets.SUB_TOKEN }}
+        run: bash tools/run_check.sh
