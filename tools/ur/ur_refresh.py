@@ -173,7 +173,7 @@ def kv_put(key, content):
 
 
 def load_state():
-    if STATE_MODE == 'kv':
+    if STATE_MODE in ('kv', 'worker'):
         raw = kv_get(STATE_KEY)
         if not raw:
             return []
