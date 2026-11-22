@@ -86,35 +86,56 @@ def oidc_token(force_refresh=False):
     return _OIDC
 
 
+def _curl_worker(method, url, body=None, token=None):
+    """经 curl 访问 Worker /ur-push。必须用浏览器 UA：
+    urllib 的 Python-urllib UA 会被 Cloudflare 以 1010 拦截 POST。"""
+    ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+    cmd = ['curl', '-sS', '-m', '60', '-A', ua, '-X', method, url,
+           '-H', 'Authorization: Bearer ' + (token or ''),
+           '-w', '\n%{http_code}']
+    if body is not None:
+        cmd += ['-H', 'Content-Type: application/json', '-d', body]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    out = p.stdout or ''
+    if '\n' in out:
+        body_out, code_s = out.rsplit('\n', 1)
+        try:
+            code = int(code_s.strip())
+        except ValueError:
+            code = 0
+    else:
+        body_out, code = out, 0
+    return code, body_out, p.stderr or ''
+
+
 def worker_get(key):
     url = WORKER_BASE + '/ur-push?key=' + urllib.parse.quote(key, safe='')
     for attempt in range(2):
-        req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + oidc_token(force_refresh=(attempt > 0))})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read().decode('utf-8')
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            if e.code == 401 and attempt == 0:
-                continue  # token 可能已过期，刷新一次重试
-            raise SystemExit(f'worker GET {key} failed: {e.code} {e.read()[:160]!r}')
+        code, body, err = _curl_worker('GET', url, token=oidc_token(force_refresh=(attempt > 0)))
+        if code == 200:
+            return body
+        if code == 404:
+            return None
+        if code == 401 and attempt == 0:
+            continue  # token 可能已过期，刷新一次重试
+        raise SystemExit(f'worker GET {key} failed: HTTP {code} {body[:160]!r} {err[:120]!r}')
 
 
 def worker_put(key, content):
     url = WORKER_BASE + '/ur-push'
     for attempt in range(2):
-        body = json.dumps({'key': key, 'value': content}).encode('utf-8')
-        req = urllib.request.Request(url, data=body,
-                                     headers={'Authorization': 'Bearer ' + oidc_token(force_refresh=(attempt > 0)),
-                                              'Content-Type': 'application/json'})
+        body = json.dumps({'key': key, 'value': content})
+        code, resp, err = _curl_worker('POST', url, body=body,
+                                       token=oidc_token(force_refresh=(attempt > 0)))
+        if code == 401 and attempt == 0:
+            continue  # token 可能已过期，刷新一次重试
+        if code != 200:
+            return False, f'HTTP {code} {resp[:160]!r} {err[:120]!r}'
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                d = json.load(r)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and attempt == 0:
-                continue  # token 可能已过期，刷新一次重试
-            return False, f'HTTP {e.code} {e.read()[:160]!r}'
+            d = json.loads(resp)
+        except json.JSONDecodeError:
+            return False, f'bad json {resp[:160]!r}'
         return bool(d.get('ok')), str(d)[:160]
     return False, 'unreachable'
 
@@ -288,6 +309,19 @@ def build_v2ray(nodes):
 def main():
     kept = load_state()
     dropped, added = [], []
+    # 0. 对账：删掉账号里不在状态中的僵尸代理。状态一旦丢失（如上轮崩溃），
+    # 僵尸代理会占满免费档 5 个名额，导致之后每轮都建不出新代理。
+    try:
+        live = extract.list_clients()
+    except Exception as e:
+        log_line(f'list clients failed (skip reconcile): {e}')
+        live = []
+    kept_ids = {n['auth']['proxy_config_result'].get('client_id') for n in kept}
+    for c in live:
+        cid = c.get('client_id') if isinstance(c, dict) else None
+        if cid and cid not in kept_ids:
+            extract.remove_client(cid)
+            log_line(f'removed orphan proxy {cid}')
     # 1. 验活保留
     alive = []
     for node in kept:

@@ -37,6 +37,17 @@ def api(method, path, body=None):
     except json.JSONDecodeError:
         return {'_raw': p.stdout[:300], '_stderr': p.stderr[:300]}
 
+def list_clients():
+    """账号上当前活跃的托管代理。注意：/network/clients 返回的是网络对端
+    （常为空），托管代理在 /network/proxies 下，同样是 {clients: [...]}。"""
+    d = api('GET', '/network/proxies')
+    if isinstance(d, dict):
+        return d.get('clients') or []
+    if isinstance(d, list):
+        return d
+    return []
+
+
 def remove_client(client_id):
     return api('POST', '/network/remove-client', {'client_id': client_id})
 
