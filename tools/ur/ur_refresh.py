@@ -47,7 +47,7 @@ def now_iso():
 
 def log_line(msg):
     print(f'[ur-refresh] {msg}')
-    if STATE_MODE == 'kv':
+    if STATE_MODE in ('kv', 'worker'):
         return
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -66,10 +66,11 @@ def cf_auth():
     raise SystemExit('no Cloudflare credential (CF_API_TOKEN or connector)')
 
 
-def oidc_token():
-    """GitHub Actions 的 OIDC JWT（workflow 需 id-token: write 权限）。"""
+def oidc_token(force_refresh=False):
+    """GitHub Actions 的 OIDC JWT（workflow 需 id-token: write 权限）。
+    token 有效期只有几分钟：推送阶段在启动 7 分钟后才到，必须能刷新。"""
     global _OIDC
-    if _OIDC:
+    if _OIDC and not force_refresh:
         return _OIDC
     url = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL')
     tok = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN')
@@ -87,28 +88,35 @@ def oidc_token():
 
 def worker_get(key):
     url = WORKER_BASE + '/ur-push?key=' + urllib.parse.quote(key, safe='')
-    req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + oidc_token()})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return r.read().decode('utf-8')
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        raise SystemExit(f'worker GET {key} failed: {e.code} {e.read()[:160]!r}')
+    for attempt in range(2):
+        req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + oidc_token(force_refresh=(attempt > 0))})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read().decode('utf-8')
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code == 401 and attempt == 0:
+                continue  # token 可能已过期，刷新一次重试
+            raise SystemExit(f'worker GET {key} failed: {e.code} {e.read()[:160]!r}')
 
 
 def worker_put(key, content):
     url = WORKER_BASE + '/ur-push'
-    body = json.dumps({'key': key, 'value': content}).encode('utf-8')
-    req = urllib.request.Request(url, data=body,
-                                 headers={'Authorization': 'Bearer ' + oidc_token(),
-                                          'Content-Type': 'application/json'})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            d = json.load(r)
-    except urllib.error.HTTPError as e:
-        return False, f'HTTP {e.code} {e.read()[:160]!r}'
-    return bool(d.get('ok')), str(d)[:160]
+    for attempt in range(2):
+        body = json.dumps({'key': key, 'value': content}).encode('utf-8')
+        req = urllib.request.Request(url, data=body,
+                                     headers={'Authorization': 'Bearer ' + oidc_token(force_refresh=(attempt > 0)),
+                                              'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                d = json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and attempt == 0:
+                continue  # token 可能已过期，刷新一次重试
+            return False, f'HTTP {e.code} {e.read()[:160]!r}'
+        return bool(d.get('ok')), str(d)[:160]
+    return False, 'unreachable'
 
 
 def kv_get(key):
@@ -162,7 +170,7 @@ def load_state():
 
 def save_state(nodes):
     data = json.dumps(nodes, ensure_ascii=False, indent=1)
-    if STATE_MODE == 'kv':
+    if STATE_MODE in ('kv', 'worker'):
         ok, msg = kv_put(STATE_KEY, data)
         if not ok:
             raise SystemExit(f'state KV put failed: {msg}')
@@ -357,7 +365,7 @@ def main():
                           'isp': n['exit'].get('isp')} for n in alive]}
     log_line('kept=%d added=%d dropped=%d pushed=%s nodes=%s' % (
         summary['kept'], len(added), len(dropped), pushed,
-        ','.join(n['name'] for n in alive) or '-'))
+        ','.join(node_name(n) for n in alive) or '-'))
     print(json.dumps(summary, ensure_ascii=False, indent=1))
     if not alive:
         print('WARN: subscription is EMPTY (no live UR nodes)', file=sys.stderr)
