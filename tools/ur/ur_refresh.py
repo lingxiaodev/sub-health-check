@@ -248,7 +248,7 @@ def build_clash(nodes):
         proxies.append({
             'name': node.get('name') or node_name(node), 'type': 'socks5',
             'server': node['socks_host'], 'port': node['socks_port'],
-            'username': res.get('auth_token'), 'password': '',
+            'username': res.get('auth_token'), 'password': 'x',
         })
     names = [p['name'] for p in proxies]
     doc = {'mixed-port': 7890, 'allow-lan': False, 'mode': 'rule',
@@ -304,7 +304,7 @@ def build_v2ray(nodes):
         res = node['auth']['proxy_config_result']
         token = urllib.parse.quote(res.get('auth_token', ''), safe='-_.~')
         name = urllib.parse.quote(node.get('name') or node_name(node), safe='-')
-        lines.append(f"socks://{token}:@{node['socks_host']}:{node['socks_port']}#{name}")
+        lines.append(f"socks://{token}:x@{node['socks_host']}:{node['socks_port']}#{name}")
     return '\n'.join(lines) + ('\n' if lines else '')
 
 
