@@ -211,7 +211,9 @@ def node_name(node):
     cc = (node['exit'].get('country_code') or 'xx').upper()
     city = sanitize(node['exit'].get('city'), 'unknown')
     isp = sanitize((node['exit'].get('isp') or '').split()[0], 'isp')
-    return f'UR-{cc}-{city}-{isp}'
+    ip = node['exit'].get('ip') or ''
+    tail = ip.rsplit('.', 1)[-1] if '.' in ip else ip.rsplit(':', 1)[-1]
+    return f'UR-{cc}-{city}-{isp}-{tail}'
 
 
 def proxy_check(node):
@@ -244,7 +246,7 @@ def build_clash(nodes):
     for node in nodes:
         res = node['auth']['proxy_config_result']
         proxies.append({
-            'name': node_name(node), 'type': 'socks5',
+            'name': node.get('name') or node_name(node), 'type': 'socks5',
             'server': node['socks_host'], 'port': node['socks_port'],
             'username': res.get('auth_token'), 'password': '',
         })
@@ -301,7 +303,7 @@ def build_v2ray(nodes):
     for node in nodes:
         res = node['auth']['proxy_config_result']
         token = urllib.parse.quote(res.get('auth_token', ''), safe='-_.~')
-        name = urllib.parse.quote(node_name(node), safe='-')
+        name = urllib.parse.quote(node.get('name') or node_name(node), safe='-')
         lines.append(f"socks://{token}:@{node['socks_host']}:{node['socks_port']}#{name}")
     return '\n'.join(lines) + ('\n' if lines else '')
 
@@ -309,6 +311,23 @@ def build_v2ray(nodes):
 def main():
     kept = load_state()
     dropped, added = [], []
+    # 0a. 按出口 IP 去重（多个 provider 记录可共用一个出口 IP，如 GoCodeIT
+    # 的两个 provider 共用 23.246.184.33）。重复的删掉并释放其代理。
+    seen_ips = {}
+    deduped = []
+    for node in kept:
+        ip = (node.get('exit') or {}).get('ip')
+        if ip and ip in seen_ips:
+            cid = node['auth']['proxy_config_result'].get('client_id')
+            if cid:
+                extract.remove_client(cid)
+            dropped.append({'name': node_name(node), 'reason': f'duplicate exit IP {ip}'})
+            log_line(f'dropped duplicate exit IP {ip} ({node_name(node)})')
+            continue
+        if ip:
+            seen_ips[ip] = node
+        deduped.append(node)
+    kept = deduped
     # 0. 对账：删掉账号里不在状态中的僵尸代理。状态一旦丢失（如上轮崩溃），
     # 僵尸代理会占满免费档 5 个名额，导致之后每轮都建不出新代理。
     try:
@@ -343,6 +362,7 @@ def main():
         alive = alive[:TARGET]
     # 2. 缺额补抽：按国家优先级轮询，不设每国配额
     tried_ids = {n['provider']['client_id'] for n in alive}
+    seen_ips = {n['exit'].get('ip') for n in alive if n['exit'].get('ip')}
     attempts_total = 0
     for _pass in range(3):
         if len(alive) >= TARGET or attempts_total >= MAX_ATTEMPTS_PER_RUN:
@@ -357,13 +377,14 @@ def main():
                 continue
             winners, attempts = extract.extract_round(
                 providers, max_attempts=MAX_ATTEMPTS_PER_COUNTRY, want=1,
-                exclude_ids=tried_ids)
+                exclude_ids=tried_ids, exclude_ips=seen_ips)
             attempts_total += len(attempts)
             for a in attempts:
                 tried_ids.add(a.get('provider_client_id', ''))
             if winners:
                 w = winners[0]
                 w['checked_at'] = now_iso()
+                seen_ips.add(w['exit'].get('ip'))
                 alive.append(w)
                 added.append({'name': node_name(w),
                               'exit': w['exit']['ip'], 'city': w['exit']['city'],
@@ -375,6 +396,16 @@ def main():
                          + '; '.join(f"#{a.get('n')} {a.get('reason')}" for a in attempts))
         if not progressed:
             break
+    # 2b. 节点名唯一化（同城同 ISP 不同 IP 也会撞名，Clash 要求代理名唯一）
+    used_names = {}
+    for node in alive:
+        base = node_name(node)
+        name, i = base, 2
+        while name in used_names:
+            name = f'{base}-{i}'
+            i += 1
+        used_names[name] = node
+        node['name'] = name
     # 3. 保存状态 + 生成订阅文件 + 推 KV
     save_state(alive)
     clash = build_clash(alive)
@@ -393,7 +424,7 @@ def main():
     pushed = all(v == 'OK' for v in results.values())
     summary = {'kept': len(alive) - len(added), 'added': added,
                'dropped': dropped, 'pushed': pushed, 'push': results,
-               'nodes': [{'name': node_name(n), 'ip': n['exit'].get('ip'),
+               'nodes': [{'name': n.get('name') or node_name(n), 'ip': n['exit'].get('ip'),
                           'city': n['exit'].get('city'),
                           'country': n['exit'].get('country'),
                           'isp': n['exit'].get('isp')} for n in alive]}

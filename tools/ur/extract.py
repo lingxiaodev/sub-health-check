@@ -193,10 +193,14 @@ def extract_one(provider):
         remove_client(created_client_id)
     return None, base
 
-def extract_round(providers, max_attempts=MAX_ATTEMPTS, want=1, exclude_ids=None):
-    """Try providers in order (already speed-sorted). Returns (winners, attempts)."""
+def extract_round(providers, max_attempts=MAX_ATTEMPTS, want=1, exclude_ids=None, exclude_ips=None):
+    """Try providers in order (already speed-sorted). Returns (winners, attempts).
+    A winner whose exit IP is already in exclude_ips (or won earlier in this
+    round) is dropped and its client removed: several provider records can
+    share one residential exit IP, so dedup must be by exit IP, not provider id."""
     winners, attempts = [], []
     tried = set(exclude_ids or [])
+    seen_ips = set(exclude_ips or [])
     for provider in providers:
         if len(winners) >= want or len(attempts) >= max_attempts:
             break
@@ -207,6 +211,16 @@ def extract_round(providers, max_attempts=MAX_ATTEMPTS, want=1, exclude_ids=None
         att['n'] = len(attempts) + 1
         attempts.append(att)
         if winner:
+            ip = (winner.get('exit') or {}).get('ip')
+            if ip and ip in seen_ips:
+                att['result'] = 'FAIL'
+                att['reason'] = f'duplicate exit IP {ip}'
+                cid = winner.get('auth', {}).get('proxy_config_result', {}).get('client_id')
+                if cid:
+                    remove_client(cid)
+                continue
+            if ip:
+                seen_ips.add(ip)
             winners.append(winner)
         # platform limit/rate error -> stop the round
         if att.get('result') == 'auth-error' and (
